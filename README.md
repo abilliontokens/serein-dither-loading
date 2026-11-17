@@ -69,8 +69,8 @@ frames) and uses under 40% of the call's fuel; the other models need less.
 
 ## Build and install
 
-The SDK dependency points at a local Serein checkout in `Cargo.toml`
-(`path = "the pinned Serein revision"`); the release pins a git revision.
+The SDK dependency in `Cargo.toml` is pinned to Serein commit `0434bc7c`, the
+preview revision whose start screen plays plugin-rendered frames.
 
 ```sh
 rustup target add wasm32-unknown-unknown
