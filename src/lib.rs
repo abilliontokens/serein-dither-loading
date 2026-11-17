@@ -1,14 +1,14 @@
-//! Dither Loading: replaces Serein's start (connecting) screen with "Loading"
-//! in dither pixel text and a procedurally minted spinning model.
+//! Dither Loading: replaces Serein's start (connecting) screen with
+//! "Loading..." in dither pixel text and a procedurally minted spinning model.
 //!
 //! The plugin draws nothing. Activation returns a declarative [`StartScreen`]
 //! through [`StartScreenOutput`]; the host keeps the last accepted value and
 //! renders the text and the mesh through its ordered-dither (Bayer) raster
 //! before any account data loads. The mesh is minted in code (no assets): a
-//! faceted planet with a tilted ring, a trefoil torus knot, or a crystal, in
-//! that order; the panel's `next-model` button cycles them and `toggle`
-//! restores the stock screen. Choices persist through the `storage` grant and
-//! corrupt storage falls back to the defaults (on, first model).
+//! spiky body (an icosphere bristling with cones), a trefoil torus knot, or a
+//! crystal, in that order; the panel's `next-model` button cycles them and
+//! `toggle` restores the stock screen. Choices persist through the `storage`
+//! grant and corrupt storage falls back to the defaults (on, first model).
 
 use std::collections::BTreeMap;
 use std::f32::consts::TAU;
@@ -30,7 +30,7 @@ const COLORS: [&str; MODEL_COUNT] = ["#B79CFF", "#8FB7FF", "#D3B8FF"];
 /// Names shown in the settings panel.
 fn model_name(index: usize) -> &'static str {
 	match index {
-		0 => "ringed planet",
+		0 => "spiky body",
 		1 => "torus knot",
 		_ => "crystal",
 	}
@@ -39,7 +39,7 @@ fn model_name(index: usize) -> &'static str {
 /// The mesh for a model index: geometry minted in code, presentation set once.
 fn mesh(index: usize) -> StartModel {
 	let (vertices, triangles) = match index {
-		0 => planet_with_ring(),
+		0 => spiky_body(),
 		1 => torus_knot(),
 		_ => crystal(),
 	};
@@ -55,10 +55,11 @@ fn mesh(index: usize) -> StartModel {
 /// The start screen the plugin asks for with a given model.
 fn screen(model: usize) -> StartScreen {
 	StartScreen {
-		title: Some("Loading".into()),
-		subtitle: Some("Connecting to Discord".into()),
+		title: Some("Loading...".into()),
+		subtitle: None,
 		text_style: StartTextStyle::Dither,
 		hide_logo: true,
+		compact: true,
 		model: Some(mesh(model)),
 	}
 }
@@ -87,6 +88,39 @@ fn unit(vector: [f32; 3]) -> [f32; 3] {
 	scaled(vector, 1.0 / dot(vector, vector).sqrt())
 }
 
+/// Two unit vectors perpendicular to `axis`, with `first × second = axis`, so
+/// a ring swept from `first` toward `second` turns counter-clockwise about it.
+fn frame(axis: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+	// The world axis least aligned with `axis` anchors a stable frame.
+	let reference = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+		.into_iter()
+		.min_by(|a, b| dot(*a, axis).abs().total_cmp(&dot(*b, axis).abs()))
+		.expect("three axes");
+	let second = unit(cross(axis, reference));
+	(cross(second, axis), second)
+}
+
+/// Push `sides` points on a circle around `center`, counter-clockwise about
+/// the unit `axis`.
+fn push_ring(
+	vertices: &mut Vec<[f32; 3]>,
+	center: [f32; 3],
+	axis: [f32; 3],
+	radius: f32,
+	sides: usize,
+) {
+	let (first, second) = frame(axis);
+	for side in 0..sides {
+		let (sin, cos) = (side as f32 * TAU / sides as f32).sin_cos();
+		let offset = sum(scaled(first, radius * cos), scaled(second, radius * sin));
+		vertices.push(sum(center, offset));
+	}
+}
+
+fn vertex_index(index: usize) -> u16 {
+	u16::try_from(index).expect("vertex count fits u16")
+}
+
 /// The shared midpoint of edge `a`–`b`, pushed onto the unit sphere and
 /// minted once per edge.
 fn midpoint(
@@ -99,16 +133,13 @@ fn midpoint(
 	*cache.entry(key).or_insert_with(|| {
 		let middle = sum(vertices[usize::from(a)], vertices[usize::from(b)]);
 		vertices.push(unit(middle));
-		u16::try_from(vertices.len() - 1).expect("vertex count fits u16")
+		vertex_index(vertices.len() - 1)
 	})
 }
 
-/// Faceted planet: an icosphere (one subdivision of an icosahedron, 42
-/// vertices, 80 triangles) plus a tilted annulus ring, emitted with both
-/// windings so the raster shows it from either side.
-fn planet_with_ring() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
-	const SEGMENTS: usize = 16;
-	const RING_TILT: f32 = 0.55;
+/// Faceted unit icosphere: one subdivision of an icosahedron, 42 vertices
+/// and 80 counter-clockwise triangles.
+fn icosphere() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
 	let ratio = 0.5 * (1.0 + 5.0_f32.sqrt());
 	let mut vertices: Vec<[f32; 3]> = [
 		[-1.0, ratio, 0.0],
@@ -167,32 +198,32 @@ fn planet_with_ring() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
 		triangles.push([ab, bc, ca]);
 	}
 
-	// The ring: an annulus around the equator, tilted like a ringed planet.
-	let ring_base = vertices.len();
-	let (tilt_sin, tilt_cos) = RING_TILT.sin_cos();
-	for step in 0..SEGMENTS {
-		let angle = step as f32 * TAU / SEGMENTS as f32;
-		let (sin, cos) = angle.sin_cos();
-		for radius in [1.55_f32, 2.3] {
-			// The annulus lies in the x-z plane, then rotates around the x axis.
-			vertices.push([
-				radius * cos,
-				-radius * sin * tilt_sin,
-				radius * sin * tilt_cos,
-			]);
+	(vertices, triangles)
+}
+
+/// The dither-ui world sample's spiky body: an icosphere core with a sharp
+/// six-sided cone radiating from each of its 42 vertices. Each cone's open
+/// base sits just inside the core, so the core hides it.
+fn spiky_body() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
+	const SIDES: usize = 6;
+	const BASE: f32 = 0.9;
+	const RADIUS: f32 = 0.17;
+	const TIP: f32 = 1.8;
+	let (mut vertices, mut triangles) = icosphere();
+	let core = vertices.len();
+	vertices.reserve(core * (SIDES + 1));
+	triangles.reserve(core * SIDES);
+	for index in 0..core {
+		let axis = vertices[index];
+		let base = vertices.len();
+		push_ring(&mut vertices, scaled(axis, BASE), axis, RADIUS, SIDES);
+		let tip = vertex_index(vertices.len());
+		vertices.push(scaled(axis, TIP));
+		for side in 0..SIDES {
+			let current = vertex_index(base + side);
+			let next = vertex_index(base + (side + 1) % SIDES);
+			triangles.push([current, next, tip]);
 		}
-	}
-	for step in 0..SEGMENTS {
-		let following = (step + 1) % SEGMENTS;
-		let current = (ring_base + step * 2) as u16;
-		let next = (ring_base + following * 2) as u16;
-		let (inner, outer) = (current, current + 1);
-		let (inner_next, outer_next) = (next, next + 1);
-		// Top and bottom windings, so the ring reads from both sides.
-		triangles.push([inner, outer, outer_next]);
-		triangles.push([inner, outer_next, inner_next]);
-		triangles.push([inner, outer_next, outer]);
-		triangles.push([inner, inner_next, outer_next]);
 	}
 
 	(vertices, triangles)
@@ -226,25 +257,10 @@ fn torus_knot() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
 	for (sample, center) in centers.iter().enumerate() {
 		let t = sample as f32 * step;
 		let tangent = unit(sum(point(t + step), scaled(point(t - step), -1.0)));
-		// The axis least aligned with the tangent anchors a stable frame.
-		let reference = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-			.into_iter()
-			.min_by(|a, b| dot(*a, tangent).abs().total_cmp(&dot(*b, tangent).abs()))
-			.expect("three axes");
-		let bitangent = unit(cross(tangent, reference));
-		let normal = cross(bitangent, tangent);
-		for side in 0..RADIAL {
-			let angle = side as f32 * TAU / RADIAL as f32;
-			let offset = sum(
-				scaled(normal, TUBE * angle.cos()),
-				scaled(bitangent, TUBE * angle.sin()),
-			);
-			vertices.push(sum(*center, offset));
-		}
+		push_ring(&mut vertices, *center, tangent, TUBE, RADIAL);
 	}
 
-	let index =
-		|sample: usize, side: usize| u16::try_from(sample * RADIAL + side).expect("fits u16");
+	let index = |sample: usize, side: usize| vertex_index(sample * RADIAL + side);
 	let mut triangles: Vec<[u16; 3]> = Vec::with_capacity(SAMPLES * RADIAL * 2);
 	for sample in 0..SAMPLES {
 		let next = (sample + 1) % SAMPLES;
@@ -337,11 +353,13 @@ fn current(state: &Saved) -> Option<StartScreen> {
 fn panel(state: &Saved) -> Vec<Element> {
 	let text = if state.off {
 		"Dither Loading is off: Serein shows its normal start screen while it \
-		 connects. Turn it on for dither pixel text and a spinning model instead."
+		 starts. Turn it on for a compact splash with dither pixel text and a \
+		 spinning model instead."
 	} else {
-		"Dither Loading is on: while Serein connects, the screen hides the logo \
-		 and shows Loading in dither pixel text with a spinning model. Turn it \
-		 off to restore the normal start screen, or switch to the next model."
+		"Dither Loading is on: while Serein starts, a compact splash window \
+		 shows Loading... in dither pixel text with a spinning model, without \
+		 the logo. Turn it off to restore the normal start screen, or switch to \
+		 the next model."
 	};
 	vec![
 		Element::Text {
@@ -431,17 +449,33 @@ mod tests {
 			.sum()
 	}
 
+	/// For bodies star-shaped about the origin: every triangle faces away
+	/// from it, which a global volume could mask for small inverted parts.
+	fn faces_outward(model: &StartModel) -> bool {
+		let at = |index: u16| model.vertices[usize::from(index)];
+		model.triangles.iter().all(|&[a, b, c]| {
+			let normal = cross(
+				sum(at(b), scaled(at(a), -1.0)),
+				sum(at(c), scaled(at(a), -1.0)),
+			);
+			dot(normal, sum(sum(at(a), at(b)), at(c))) > 0.0
+		})
+	}
+
 	#[test]
 	fn every_model_validates_within_bounds() {
-		// (vertices, triangles) per model; the README's table quotes these.
-		let sizes = [(74, 144), (768, 1536), (8, 12)];
-		for (index, size) in sizes.into_iter().enumerate() {
+		// (vertices, triangles, star-shaped) per model; the README quotes sizes.
+		let models = [(336, 332, true), (768, 1536, false), (8, 12, true)];
+		for (index, (vertices, triangles, star)) in models.into_iter().enumerate() {
 			let screen = screen(index);
 			screen
 				.validate()
 				.unwrap_or_else(|error| panic!("model {index} ({}): {error}", model_name(index)));
 			let model = screen.model.expect("screen carries a model");
-			assert_eq!((model.vertices.len(), model.triangles.len()), size);
+			assert_eq!(
+				(model.vertices.len(), model.triangles.len()),
+				(vertices, triangles)
+			);
 			assert!(model.vertices.len() <= MAX_START_MODEL_VERTICES);
 			assert!(model.triangles.len() <= MAX_START_MODEL_TRIANGLES);
 			assert!(
@@ -452,24 +486,26 @@ mod tests {
 					.all(|value| value.is_finite() && value.abs() <= MAX_START_MODEL_COORDINATE)
 			);
 			assert!(signed_volume(&model) > 0.0, "model {index} winds inward");
+			assert!(
+				!star || faces_outward(&model),
+				"model {index} has an inward face"
+			);
 		}
 	}
 
 	#[test]
 	fn activation_replaces_the_start_screen() {
 		let value = call("activate", None);
-		assert_eq!(value["start_screen"]["title"], "Loading");
-		assert_eq!(value["start_screen"]["subtitle"], "Connecting to Discord");
-		assert_eq!(value["start_screen"]["text_style"], "dither");
-		assert_eq!(value["start_screen"]["hide_logo"], true);
-		assert_eq!(value["start_screen"]["model"]["color"], "#B79CFF");
-		assert_eq!(value["start_screen"]["model"]["spin"], 24.0);
-		assert_eq!(value["start_screen"]["model"]["pitch"], 20.0);
-		assert!(
-			value["start_screen"]["model"]["vertices"]
-				.as_array()
-				.is_some_and(|list| !list.is_empty())
-		);
+		let screen = &value["start_screen"];
+		assert_eq!(screen["title"], "Loading...");
+		assert!(screen.get("subtitle").is_none());
+		assert_eq!(screen["text_style"], "dither");
+		assert_eq!(screen["hide_logo"], true);
+		assert_eq!(screen["compact"], true);
+		assert_eq!(screen["model"]["color"], "#B79CFF");
+		assert_eq!(screen["model"]["spin"], 24.0);
+		assert_eq!(screen["model"]["pitch"], 20.0);
+		assert_eq!(triangles(&value), Some(332));
 	}
 
 	#[test]
@@ -483,7 +519,7 @@ mod tests {
 		assert!(still_off.get("start_screen").is_some_and(Value::is_null));
 
 		let on = call("toggle", Some(&storage));
-		assert_eq!(on["start_screen"]["title"], "Loading");
+		assert_eq!(on["start_screen"]["title"], "Loading...");
 	}
 
 	#[test]
@@ -496,8 +532,8 @@ mod tests {
 		assert_eq!(triangles(&crystal), Some(mesh(2).triangles.len()));
 		let storage = crystal["storage"].as_str().expect("persisted").to_string();
 
-		let planet = call("next-model", Some(&storage));
-		assert_eq!(triangles(&planet), Some(mesh(0).triangles.len()));
+		let spiky = call("next-model", Some(&storage));
+		assert_eq!(triangles(&spiky), Some(mesh(0).triangles.len()));
 	}
 
 	#[test]
@@ -511,7 +547,7 @@ mod tests {
 		] {
 			let value = call("activate", Some(corrupt));
 			assert_eq!(
-				value["start_screen"]["title"], "Loading",
+				value["start_screen"]["title"], "Loading...",
 				"storage: {corrupt}"
 			);
 			assert_eq!(triangles(&value), Some(mesh(0).triangles.len()));
