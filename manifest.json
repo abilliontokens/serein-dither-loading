@@ -1,0 +1,20 @@
+{
+  "api_version": 1,
+  "id": "dither-loading",
+  "name": "Dither Loading",
+  "version": "1.0.0",
+  "author": "Serein contributors",
+  "license": "MIT OR Apache-2.0",
+  "source": "https://github.com/abilliontokens/serein-dither-loading",
+  "kind": "plugin",
+  "capabilities": [
+    "start_screen",
+    "storage"
+  ],
+  "actions": [
+    {"id": "activate", "label": "Customize the start screen", "surface": "activation"},
+    {"id": "show", "label": "Dither Loading settings", "surface": "panel"},
+    {"id": "toggle", "label": "Toggle the custom start screen", "surface": "panel"},
+    {"id": "next-model", "label": "Next loading model", "surface": "panel"}
+  ]
+}

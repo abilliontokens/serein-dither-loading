@@ -1,0 +1,21 @@
+[package]
+name = "dither-loading"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/abilliontokens/serein-dither-loading"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Local Serein checkout for development; the parent PR pins a git rev before release.
+serein-extension-sdk = { path = "../Serein/extensions/sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
