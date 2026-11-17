@@ -230,7 +230,6 @@ dependencies = [
 [[package]]
 name = "serein-extension-sdk"
 version = "0.1.0"
-source = "git+https://github.com/abilliontokens/Serein?rev=cce25000a636ccddc84ff8f5627b0c60e572466d#cce25000a636ccddc84ff8f5627b0c60e572466d"
 dependencies = [
  "serde",
  "serde_json",

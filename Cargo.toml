@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Local Serein checkout for development; the parent PR pins a git rev before release.
-serein-extension-sdk = { git = "https://github.com/abilliontokens/Serein", rev = "cce25000a636ccddc84ff8f5627b0c60e572466d" }
+serein-extension-sdk = { path = "../Serein/extensions/sdk" }
 
 [profile.release]
 opt-level = "s"

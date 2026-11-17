@@ -1,305 +1,109 @@
-//! Dither Loading: replaces Serein's start (connecting) screen with
-//! "Loading..." in dither pixel text and a procedurally minted spinning model.
+//! Dither Loading: replaces Serein's start (connecting) screen with a spinning low-poly model
+//! above "Loading..." in dither pixel text, in a small splash window.
 //!
-//! The plugin draws nothing. Activation returns a declarative [`StartScreen`]
-//! through [`StartScreenOutput`]; the host keeps the last accepted value and
-//! renders the text and the mesh through its ordered-dither (Bayer) raster
-//! before any account data loads. The mesh is minted in code (no assets): a
-//! spiky body (an icosphere bristling with cones), a trefoil torus knot, or a
-//! crystal, in that order; the panel's `next-model` button cycles them and
-//! `toggle` restores the stock screen. Choices persist through the `storage`
-//! grant and corrupt storage falls back to the defaults (on, first model).
-
-use std::collections::BTreeMap;
-use std::f32::consts::TAU;
+//! The plugin renders everything itself; Serein only plays the frames back. Its renderer
+//! (`render.rs`: a 5x9 pixel font, a 4x4 ordered (Bayer) dither and a mesh rasterizer) and
+//! its meshes (`mesh.rs`, minted in code: a spiky body, a trefoil torus knot and a crystal)
+//! run in `build.rs`, which pre-renders every frame as packed 2-bit cells, because a plugin
+//! call's 10M Wasm fuel could not rasterize a spin loop. Activation returns those frames,
+//! base64-encoded, as a declarative [`StartScreen`] through [`StartScreenOutput`]. The
+//! panel's `next-model` button cycles the models and `toggle` restores the stock screen.
+//! Choices persist through the `storage` grant, and corrupt storage falls back to the
+//! defaults (on, first model).
 
 use serein_extension_sdk::serde_json::{self, Value};
 use serein_extension_sdk::{
-	Element, Invocation, Output, StartModel, StartScreen, StartScreenOutput, StartTextStyle,
+	Element, Invocation, Output, StartImage, StartScreen, StartScreenOutput, StartWindow,
 };
 
-/// How many models the plugin mints; `next-model` cycles through them.
-const MODEL_COUNT: usize = 3;
-/// Yaw speed in degrees per second; a touch faster than the dither-ui default.
-const SPIN: f32 = 24.0;
-/// Fixed pitch toward the viewer in degrees.
-const PITCH: f32 = 20.0;
-/// Palette chosen to read on a dark background.
+/// A pre-rendered image: `width × height` cells of `cell` logical pixels each, and its
+/// packed 2-bit frames back to back.
+struct Art {
+	width: u16,
+	height: u16,
+	cell: u8,
+	cells: &'static [u8],
+}
+
+/// A model's name and its seamless spin loop.
+struct Model {
+	name: &'static str,
+	art: Art,
+}
+
+// `FPS`, `LOADING` and `MODELS`, rendered by build.rs.
+include!(concat!(env!("OUT_DIR"), "/art.rs"));
+
+/// How many models the plugin offers; `next-model` cycles through them.
+const MODEL_COUNT: usize = MODELS.len();
+/// Lit color of each model, chosen to read on a dark background. Its shade is the same
+/// color at 0x2E (about 0.18) opacity.
 const COLORS: [&str; MODEL_COUNT] = ["#B79CFF", "#8FB7FF", "#D3B8FF"];
+/// Color of the lit text pixels.
+const TEXT_COLOR: &str = "#EDEDEF";
+/// The splash window: 244 pixels of images (the model, then the text 16 pixels below it)
+/// above Serein's progress bar and account button, about 140 pixels with their padding,
+/// leaves room for its header and margins, so the images keep their full size.
+const WINDOW: StartWindow = StartWindow {
+	width: 360,
+	height: 480,
+};
+/// Standard base64 digits.
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Names shown in the settings panel.
-fn model_name(index: usize) -> &'static str {
-	match index {
-		0 => "spiky body",
-		1 => "torus knot",
-		_ => "crystal",
+/// The four base64 digits of a 24-bit group.
+fn digits(group: u32) -> [u8; 4] {
+	let digit = |shift: u32| BASE64[((group >> shift) & 63) as usize];
+	[digit(18), digit(12), digit(6), digit(0)]
+}
+
+/// Standard padded base64 of `bytes`. Every Wasm operator costs fuel, so whole groups take
+/// a straight-line path without per-byte loops or bounds checks.
+fn base64(bytes: &[u8]) -> String {
+	let mut text = vec![b'='; bytes.len().div_ceil(3) * 4];
+	let (groups, tail) = bytes.as_chunks::<3>();
+	let (quads, _) = text.as_chunks_mut::<4>();
+	for (&[a, b, c], quad) in groups.iter().zip(quads.iter_mut()) {
+		*quad = digits(u32::from_be_bytes([0, a, b, c]));
+	}
+	if let Some(quad) = quads.last_mut().filter(|_| !tail.is_empty()) {
+		let mut group = [0; 4];
+		group[1..=tail.len()].copy_from_slice(tail);
+		quad[..=tail.len()].copy_from_slice(&digits(u32::from_be_bytes(group))[..=tail.len()]);
+	}
+	String::from_utf8(text).expect("base64 digits are ASCII")
+}
+
+/// One screen image of `art`'s frames; base64 is all the work they need.
+fn image(art: &Art, palette: &[String]) -> StartImage {
+	let frame = (usize::from(art.width) * usize::from(art.height)).div_ceil(4);
+	StartImage {
+		width: art.width,
+		height: art.height,
+		palette: palette.to_vec(),
+		frames: art.cells.chunks(frame).map(base64).collect(),
+		fps: FPS,
+		cell: art.cell,
 	}
 }
 
-/// The mesh for a model index: geometry minted in code, presentation set once.
-fn mesh(index: usize) -> StartModel {
-	let (vertices, triangles) = match index {
-		0 => spiky_body(),
-		1 => torus_knot(),
-		_ => crystal(),
-	};
-	StartModel {
-		vertices,
-		triangles,
-		color: Some(COLORS[index].into()),
-		spin: SPIN,
-		pitch: PITCH,
-	}
-}
-
-/// The start screen the plugin asks for with a given model.
+/// The start screen with a given model: its spin loop above the still text. Both images
+/// share one palette for the cell values the renderer prints: 1 lit, 2 shade, 3 text.
 fn screen(model: usize) -> StartScreen {
+	let color = COLORS[model];
+	let palette = [
+		color.to_owned(),
+		format!("{color}2E"),
+		TEXT_COLOR.to_owned(),
+	];
 	StartScreen {
-		title: Some("Loading...".into()),
-		subtitle: None,
-		text_style: StartTextStyle::Dither,
-		hide_logo: true,
-		compact: true,
-		model: Some(mesh(model)),
+		images: vec![
+			image(&MODELS[model].art, &palette),
+			image(&LOADING, &palette),
+		],
+		window: Some(WINDOW),
+		..Default::default()
 	}
-}
-
-fn sum(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-	[a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn scaled(vector: [f32; 3], factor: f32) -> [f32; 3] {
-	[vector[0] * factor, vector[1] * factor, vector[2] * factor]
-}
-
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-	a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-	[
-		a[1] * b[2] - a[2] * b[1],
-		a[2] * b[0] - a[0] * b[2],
-		a[0] * b[1] - a[1] * b[0],
-	]
-}
-
-fn unit(vector: [f32; 3]) -> [f32; 3] {
-	scaled(vector, 1.0 / dot(vector, vector).sqrt())
-}
-
-/// Two unit vectors perpendicular to `axis`, with `first × second = axis`, so
-/// a ring swept from `first` toward `second` turns counter-clockwise about it.
-fn frame(axis: [f32; 3]) -> ([f32; 3], [f32; 3]) {
-	// The world axis least aligned with `axis` anchors a stable frame.
-	let reference = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-		.into_iter()
-		.min_by(|a, b| dot(*a, axis).abs().total_cmp(&dot(*b, axis).abs()))
-		.expect("three axes");
-	let second = unit(cross(axis, reference));
-	(cross(second, axis), second)
-}
-
-/// Push `sides` points on a circle around `center`, counter-clockwise about
-/// the unit `axis`.
-fn push_ring(
-	vertices: &mut Vec<[f32; 3]>,
-	center: [f32; 3],
-	axis: [f32; 3],
-	radius: f32,
-	sides: usize,
-) {
-	let (first, second) = frame(axis);
-	for side in 0..sides {
-		let (sin, cos) = (side as f32 * TAU / sides as f32).sin_cos();
-		let offset = sum(scaled(first, radius * cos), scaled(second, radius * sin));
-		vertices.push(sum(center, offset));
-	}
-}
-
-fn vertex_index(index: usize) -> u16 {
-	u16::try_from(index).expect("vertex count fits u16")
-}
-
-/// The shared midpoint of edge `a`–`b`, pushed onto the unit sphere and
-/// minted once per edge.
-fn midpoint(
-	a: u16,
-	b: u16,
-	vertices: &mut Vec<[f32; 3]>,
-	cache: &mut BTreeMap<[u16; 2], u16>,
-) -> u16 {
-	let key = [a.min(b), a.max(b)];
-	*cache.entry(key).or_insert_with(|| {
-		let middle = sum(vertices[usize::from(a)], vertices[usize::from(b)]);
-		vertices.push(unit(middle));
-		vertex_index(vertices.len() - 1)
-	})
-}
-
-/// Faceted unit icosphere: one subdivision of an icosahedron, 42 vertices
-/// and 80 counter-clockwise triangles.
-fn icosphere() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
-	let ratio = 0.5 * (1.0 + 5.0_f32.sqrt());
-	let mut vertices: Vec<[f32; 3]> = [
-		[-1.0, ratio, 0.0],
-		[1.0, ratio, 0.0],
-		[-1.0, -ratio, 0.0],
-		[1.0, -ratio, 0.0],
-		[0.0, -1.0, ratio],
-		[0.0, 1.0, ratio],
-		[0.0, -1.0, -ratio],
-		[0.0, 1.0, -ratio],
-		[ratio, 0.0, -1.0],
-		[ratio, 0.0, 1.0],
-		[-ratio, 0.0, -1.0],
-		[-ratio, 0.0, 1.0],
-	]
-	.into_iter()
-	.map(unit)
-	.collect();
-	let faces: Vec<[u16; 3]> = [
-		(0, 11, 5),
-		(0, 5, 1),
-		(0, 1, 7),
-		(0, 7, 10),
-		(0, 10, 11),
-		(1, 5, 9),
-		(5, 11, 4),
-		(11, 10, 2),
-		(10, 7, 6),
-		(7, 1, 8),
-		(3, 9, 4),
-		(3, 4, 2),
-		(3, 2, 6),
-		(3, 6, 8),
-		(3, 8, 9),
-		(4, 9, 5),
-		(2, 4, 11),
-		(6, 2, 10),
-		(8, 6, 7),
-		(9, 8, 1),
-	]
-	.into_iter()
-	.map(|(a, b, c)| [a, b, c])
-	.collect();
-
-	// One subdivision: split every face at edge midpoints pushed onto the
-	// sphere, keeping the outward counter-clockwise winding.
-	let mut cache = BTreeMap::new();
-	let mut triangles: Vec<[u16; 3]> = Vec::with_capacity(faces.len() * 4);
-	for [a, b, c] in faces {
-		let ab = midpoint(a, b, &mut vertices, &mut cache);
-		let bc = midpoint(b, c, &mut vertices, &mut cache);
-		let ca = midpoint(c, a, &mut vertices, &mut cache);
-		triangles.push([a, ab, ca]);
-		triangles.push([b, bc, ab]);
-		triangles.push([c, ca, bc]);
-		triangles.push([ab, bc, ca]);
-	}
-
-	(vertices, triangles)
-}
-
-/// The dither-ui world sample's spiky body: an icosphere core with a sharp
-/// six-sided cone radiating from each of its 42 vertices. Each cone's open
-/// base sits just inside the core, so the core hides it.
-fn spiky_body() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
-	const SIDES: usize = 6;
-	const BASE: f32 = 0.9;
-	const RADIUS: f32 = 0.17;
-	const TIP: f32 = 1.8;
-	let (mut vertices, mut triangles) = icosphere();
-	let core = vertices.len();
-	vertices.reserve(core * (SIDES + 1));
-	triangles.reserve(core * SIDES);
-	for index in 0..core {
-		let axis = vertices[index];
-		let base = vertices.len();
-		push_ring(&mut vertices, scaled(axis, BASE), axis, RADIUS, SIDES);
-		let tip = vertex_index(vertices.len());
-		vertices.push(scaled(axis, TIP));
-		for side in 0..SIDES {
-			let current = vertex_index(base + side);
-			let next = vertex_index(base + (side + 1) % SIDES);
-			triangles.push([current, next, tip]);
-		}
-	}
-
-	(vertices, triangles)
-}
-
-/// Trefoil torus knot (p = 2, q = 3): 96 samples around the path carry an
-/// 8-sided tube with parallel-ish frames.
-fn torus_knot() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
-	const SAMPLES: usize = 96;
-	const RADIAL: usize = 8;
-	const CARRIER: f32 = 2.0;
-	const TUBE: f32 = 0.31;
-	const SCALE: f32 = 0.5;
-	const P: f32 = 2.0;
-	const Q: f32 = 3.0;
-
-	let point = |t: f32| -> [f32; 3] {
-		let carrier = CARRIER + (Q * t).cos();
-		[
-			carrier * (P * t).cos() * SCALE,
-			(Q * t).sin() * SCALE * 1.6,
-			carrier * (P * t).sin() * SCALE,
-		]
-	};
-	let step = TAU / SAMPLES as f32;
-	let centers: Vec<[f32; 3]> = (0..SAMPLES)
-		.map(|sample| point(sample as f32 * step))
-		.collect();
-
-	let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(SAMPLES * RADIAL);
-	for (sample, center) in centers.iter().enumerate() {
-		let t = sample as f32 * step;
-		let tangent = unit(sum(point(t + step), scaled(point(t - step), -1.0)));
-		push_ring(&mut vertices, *center, tangent, TUBE, RADIAL);
-	}
-
-	let index = |sample: usize, side: usize| vertex_index(sample * RADIAL + side);
-	let mut triangles: Vec<[u16; 3]> = Vec::with_capacity(SAMPLES * RADIAL * 2);
-	for sample in 0..SAMPLES {
-		let next = (sample + 1) % SAMPLES;
-		for side in 0..RADIAL {
-			let following = (side + 1) % RADIAL;
-			let a = index(sample, side);
-			let b = index(next, side);
-			let c = index(next, following);
-			let d = index(sample, following);
-			// The frame turns from `normal` toward `bitangent` about the
-			// tangent, so outward-facing quads run against the path here.
-			triangles.push([a, c, b]);
-			triangles.push([a, d, c]);
-		}
-	}
-
-	(vertices, triangles)
-}
-
-/// A hexagonal bipyramid crystal: two apexes over a six-sided girdle.
-fn crystal() -> (Vec<[f32; 3]>, Vec<[u16; 3]>) {
-	const SIDES: usize = 6;
-	let mut vertices: Vec<[f32; 3]> = vec![[0.0, 1.35, 0.0]];
-	for side in 0..SIDES {
-		let angle = side as f32 * TAU / SIDES as f32;
-		vertices.push([0.72 * angle.cos(), 0.0, 0.72 * angle.sin()]);
-	}
-	vertices.push([0.0, -1.35, 0.0]);
-	let top = 0_u16;
-	let bottom = SIDES as u16 + 1;
-	let mut triangles: Vec<[u16; 3]> = Vec::with_capacity(SIDES * 2);
-	for side in 0..SIDES as u16 {
-		let current = side + 1;
-		let following = (side + 1) % SIDES as u16 + 1;
-		triangles.push([top, following, current]);
-		triangles.push([bottom, current, following]);
-	}
-
-	(vertices, triangles)
 }
 
 /// Persisted choices. Corrupt or missing storage falls back to the default:
@@ -353,17 +157,17 @@ fn current(state: &Saved) -> Option<StartScreen> {
 fn panel(state: &Saved) -> Vec<Element> {
 	let text = if state.off {
 		"Dither Loading is off: Serein shows its normal start screen while it \
-		 starts. Turn it on for a compact splash with dither pixel text and a \
-		 spinning model instead."
+		 starts. Turn it on for a splash window with a spinning model and \
+		 dither pixel text instead."
 	} else {
-		"Dither Loading is on: while Serein starts, a compact splash window \
-		 shows Loading... in dither pixel text with a spinning model, without \
-		 the logo. Turn it off to restore the normal start screen, or switch to \
-		 the next model."
+		"Dither Loading is on: while Serein starts, a small splash window shows \
+		 a spinning model above Loading... in dither pixel text, without the \
+		 logo. Turn it off to restore the normal start screen, or switch to the \
+		 next model."
 	};
 	vec![
 		Element::Text {
-			text: format!("{text} Current model: {}.", model_name(state.model)),
+			text: format!("{text} Current model: {}.", MODELS[state.model].name),
 		},
 		Element::Button {
 			id: "toggle".into(),
@@ -421,75 +225,100 @@ serein_extension_sdk::export!(handle);
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use serein_extension_sdk::{
-		MAX_START_MODEL_COORDINATE, MAX_START_MODEL_TRIANGLES, MAX_START_MODEL_VERTICES,
-		dispatch_typed,
-	};
+	use serein_extension_sdk::{MAX_IO_BYTES, dispatch_typed};
+
+	fn wire(action: &str, storage: Option<&str>) -> Vec<u8> {
+		let input = serde_json::json!({"action": action, "storage": storage}).to_string();
+		dispatch_typed(input.as_bytes(), handle).expect("bounded invocation")
+	}
 
 	fn call(action: &str, storage: Option<&str>) -> Value {
-		let input = serde_json::json!({"action": action, "storage": storage}).to_string();
-		let bytes = dispatch_typed(input.as_bytes(), handle).expect("bounded invocation");
-		serde_json::from_slice(&bytes).expect("wire JSON")
+		serde_json::from_slice(&wire(action, storage)).expect("wire JSON")
 	}
 
-	fn triangles(value: &Value) -> Option<usize> {
-		value["start_screen"]["model"]["triangles"]
-			.as_array()
-			.map(Vec::len)
+	/// The lit color of the model a returned screen shows.
+	fn color(value: &Value) -> &Value {
+		&value["start_screen"]["images"][0]["palette"][0]
 	}
 
-	/// Signed volume; positive when closed surfaces wind counter-clockwise
-	/// seen from outside, as the SDK contract requires.
-	fn signed_volume(model: &StartModel) -> f32 {
-		let at = |index: u16| model.vertices[usize::from(index)];
-		model
-			.triangles
-			.iter()
-			.map(|&[a, b, c]| dot(at(a), cross(at(b), at(c))) / 6.0)
-			.sum()
-	}
-
-	/// For bodies star-shaped about the origin: every triangle faces away
-	/// from it, which a global volume could mask for small inverted parts.
-	fn faces_outward(model: &StartModel) -> bool {
-		let at = |index: u16| model.vertices[usize::from(index)];
-		model.triangles.iter().all(|&[a, b, c]| {
-			let normal = cross(
-				sum(at(b), scaled(at(a), -1.0)),
-				sum(at(c), scaled(at(a), -1.0)),
-			);
-			dot(normal, sum(sum(at(a), at(b)), at(c))) > 0.0
-		})
+	/// Standard padded base64, decoded without the plugin's digit table.
+	fn decode(text: &str) -> Vec<u8> {
+		let digit = |byte: u8| {
+			u32::from(match byte {
+				b'A'..=b'Z' => byte - b'A',
+				b'a'..=b'z' => byte - b'a' + 26,
+				b'0'..=b'9' => byte - b'0' + 52,
+				b'+' => 62,
+				b'/' => 63,
+				_ => panic!("not a base64 digit: {byte}"),
+			})
+		};
+		text.as_bytes()
+			.chunks(4)
+			.flat_map(|chunk| {
+				let digits = chunk.iter().take_while(|byte| **byte != b'=').count();
+				let group = chunk[..digits]
+					.iter()
+					.enumerate()
+					.fold(0, |group, (index, byte)| {
+						group | (digit(*byte) << (18 - 6 * index))
+					});
+				(0..digits - 1).map(move |index| (group >> (16 - 8 * index)) as u8)
+			})
+			.collect()
 	}
 
 	#[test]
-	fn every_model_validates_within_bounds() {
-		// (vertices, triangles, star-shaped) per model; the README quotes sizes.
-		let models = [(336, 332, true), (768, 1536, false), (8, 12, true)];
-		for (index, (vertices, triangles, star)) in models.into_iter().enumerate() {
-			let screen = screen(index);
+	fn every_model_emits_a_valid_screen_within_the_output_limit() {
+		for (model, Model { name, .. }) in MODELS.iter().enumerate() {
+			let storage = storage_json(&Saved { off: false, model });
+			let bytes = wire("activate", Some(&storage));
+			assert!(
+				bytes.len() < MAX_IO_BYTES,
+				"{name}: {} output bytes",
+				bytes.len()
+			);
+			let output: StartScreenOutput = serde_json::from_slice(&bytes).expect("typed output");
+			let screen = output.start_screen.flatten().expect("a start screen");
 			screen
 				.validate()
-				.unwrap_or_else(|error| panic!("model {index} ({}): {error}", model_name(index)));
-			let model = screen.model.expect("screen carries a model");
-			assert_eq!(
-				(model.vertices.len(), model.triangles.len()),
-				(vertices, triangles)
-			);
-			assert!(model.vertices.len() <= MAX_START_MODEL_VERTICES);
-			assert!(model.triangles.len() <= MAX_START_MODEL_TRIANGLES);
-			assert!(
-				model
-					.vertices
-					.iter()
-					.flatten()
-					.all(|value| value.is_finite() && value.abs() <= MAX_START_MODEL_COORDINATE)
-			);
-			assert!(signed_volume(&model) > 0.0, "model {index} winds inward");
-			assert!(
-				!star || faces_outward(&model),
-				"model {index} has an inward face"
-			);
+				.unwrap_or_else(|error| panic!("{name}: {error}"));
+			assert_eq!(screen.window, Some(WINDOW));
+			let [spin, text] = screen.images.as_slice() else {
+				panic!("{name}: the spin loop and the text");
+			};
+			assert!(spin.frames.len() > 1, "{name} animates");
+			assert_eq!(text.frames.len(), 1, "the text is still");
+		}
+	}
+
+	#[test]
+	fn spiky_body_first_frame_lights_its_center_and_leaves_its_corners_empty() {
+		let value = call("activate", None);
+		let model = &value["start_screen"]["images"][0];
+		let side = model["width"].as_u64().expect("width") as usize;
+		assert_eq!(model["height"].as_u64(), Some(side as u64));
+		let frame = decode(model["frames"][0].as_str().expect("first frame"));
+		assert_eq!(frame, MODELS[0].art.cells[..side * side / 4]);
+		let cell = |x: usize, y: usize| {
+			let index = y * side + x;
+			(frame[index / 4] >> (6 - 2 * (index % 4))) & 3
+		};
+		let near = |center: usize| center - 4..center + 4;
+		let lit = near(side / 2)
+			.flat_map(|y| near(side / 2).map(move |x| (x, y)))
+			.filter(|&(x, y)| cell(x, y) == 1)
+			.count();
+		assert!(lit > 0, "lit cells near the center");
+		let edges = [0..8, side - 8..side];
+		for rows in &edges {
+			for columns in &edges {
+				for y in rows.clone() {
+					for x in columns.clone() {
+						assert_eq!(cell(x, y), 0, "corner cell ({x}, {y}) is empty");
+					}
+				}
+			}
 		}
 	}
 
@@ -497,15 +326,18 @@ mod tests {
 	fn activation_replaces_the_start_screen() {
 		let value = call("activate", None);
 		let screen = &value["start_screen"];
-		assert_eq!(screen["title"], "Loading...");
+		assert!(screen.get("title").is_none());
 		assert!(screen.get("subtitle").is_none());
-		assert_eq!(screen["text_style"], "dither");
-		assert_eq!(screen["hide_logo"], true);
-		assert_eq!(screen["compact"], true);
-		assert_eq!(screen["model"]["color"], "#B79CFF");
-		assert_eq!(screen["model"]["spin"], 24.0);
-		assert_eq!(screen["model"]["pitch"], 20.0);
-		assert_eq!(triangles(&value), Some(332));
+		assert_eq!(
+			screen["window"],
+			serde_json::json!({"width": 360, "height": 480})
+		);
+		let [model, text] = [&screen["images"][0], &screen["images"][1]];
+		let palette = serde_json::json!(["#B79CFF", "#B79CFF2E", "#EDEDEF"]);
+		assert_eq!(model["palette"], palette);
+		assert_eq!(text["palette"], palette);
+		assert_eq!((&model["fps"], &model["cell"]), (&12.into(), &3.into()));
+		assert_eq!(text["frames"].as_array().map(Vec::len), Some(1));
 	}
 
 	#[test]
@@ -519,21 +351,21 @@ mod tests {
 		assert!(still_off.get("start_screen").is_some_and(Value::is_null));
 
 		let on = call("toggle", Some(&storage));
-		assert_eq!(on["start_screen"]["title"], "Loading...");
+		assert_eq!(color(&on), COLORS[0]);
 	}
 
 	#[test]
 	fn next_model_persists_and_cycles() {
 		let knot = call("next-model", None);
-		assert_eq!(triangles(&knot), Some(mesh(1).triangles.len()));
+		assert_eq!(color(&knot), COLORS[1]);
 		let storage = knot["storage"].as_str().expect("persisted").to_string();
 
 		let crystal = call("next-model", Some(&storage));
-		assert_eq!(triangles(&crystal), Some(mesh(2).triangles.len()));
+		assert_eq!(color(&crystal), COLORS[2]);
 		let storage = crystal["storage"].as_str().expect("persisted").to_string();
 
 		let spiky = call("next-model", Some(&storage));
-		assert_eq!(triangles(&spiky), Some(mesh(0).triangles.len()));
+		assert_eq!(color(&spiky), COLORS[0]);
 	}
 
 	#[test]
@@ -546,11 +378,7 @@ mod tests {
 			"[]",
 		] {
 			let value = call("activate", Some(corrupt));
-			assert_eq!(
-				value["start_screen"]["title"], "Loading...",
-				"storage: {corrupt}"
-			);
-			assert_eq!(triangles(&value), Some(mesh(0).triangles.len()));
+			assert_eq!(color(&value), COLORS[0], "storage: {corrupt}");
 		}
 	}
 }

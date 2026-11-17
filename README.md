@@ -5,28 +5,50 @@
 > Released clients do not have it yet.
 
 A [Serein](https://github.com/ViceVerse-cz/Serein) extension that replaces the
-start screen with a compact splash: **Loading...** in dither pixel text — the
-blocky Bayer-dithered look of [dither-ui](https://dither-ui.com/docs/world/) —
-above a lit, spinning low-poly model. The plugin draws nothing: it returns a
-declarative start screen and Serein renders the text and mesh through its
-ordered-dither raster before any account data loads.
+start screen with a small splash: a lit, spinning low-poly model above
+**Loading...** in dither pixel text, in the blocky Bayer-dithered look of
+[dither-ui](https://dither-ui.com/docs/world/).
 
-The models are minted in code (no assets ship in the package):
+## How it renders
 
-| Model | Shape | Size |
+The plugin renders everything itself, and Serein only plays the frames. The
+`start_screen` capability accepts pre-rendered cell images (2-bit cells colored
+from a palette of up to three colors, one still frame or a loop at a frame
+rate) and stacks them above Serein's unchanged progress bar and account button.
+Serein has no font, model or dither of its own for this screen.
+
+- `src/render.rs` is the renderer: a 5x9 pixel font whose glyph cells are filled
+  cell by cell through a 4x4 ordered (Bayer) dither over a brightness ramp down
+  each line, and a software mesh rasterizer (turntable fit, yaw spin, a fixed
+  20° pitch, perspective, a depth buffer, Lambert plus ambient light) whose
+  lighting the same dither prints as lit, shaded or empty cells.
+- `src/mesh.rs` mints the models in code; no assets ship in the package.
+- `build.rs` runs both at build time and writes every frame into the library.
+  A plugin call gets 10M units of Wasm fuel, far too little to rasterize a spin
+  loop, so activation only base64-encodes the stored frames and returns them.
+
+| Model | Shape | Spin loop |
 | --- | --- | --- |
-| Spiky body | icosphere core with a sharp six-sided cone radiating from each of its 42 vertices, like the dither-ui world sample | 336 vertices, 332 triangles |
-| Torus knot | trefoil (p=2, q=3) with an 8-sided tube | 768 vertices, 1536 triangles |
-| Crystal | hexagonal bipyramid | 8 vertices, 12 triangles |
+| Spiky body | icosphere core with a sharp six-sided cone radiating from each of its 42 vertices, like the dither-ui world sample; 336 vertices, 332 triangles | 36 frames: a half turn maps it onto itself |
+| Torus knot | trefoil (p=2, q=3) with an 8-sided tube; 768 vertices, 1536 triangles | 24 frames: a third of a turn |
+| Crystal | hexagonal bipyramid; 8 vertices, 12 triangles | 12 frames: a sixth of a turn |
 
-Each spins at 24°/s with a 20° pitch, in soft violet and blue tones chosen to
-read on a dark background.
+Each model is 64x64 cells of 3 pixels, spinning at 60°/s (5° a frame at 12
+fps). Every loop covers the smallest turn that maps its model onto itself, so it
+repeats seamlessly; the build fails if a loop's turn would not. *Loading...* is
+one still image, 16 pixels below the model, with 4-pixel glyph cells each filled
+by 2x2 dither cells. Lit model cells take the model color (soft violet and blue
+tones chosen to read on a dark background), the shaded rest of each silhouette
+and glyph the same color at 0.18 opacity, and lit text cells #EDEDEF.
+
+The spiky body's activation output is about 50 KB of JSON (37 KB of packed
+frames) and uses under 40% of the call's fuel; the other models need less.
 
 ## Grants
 
 | Capability | Why |
 | --- | --- |
-| `start_screen` | Replace the start screen's text and spinning model and show it as a compact splash. |
+| `start_screen` | Replace the start screen with the pre-rendered model and text, in a 360x480 splash window. |
 | `storage` | Remember the on/off choice and the picked model. |
 
 ## Behavior
@@ -34,8 +56,8 @@ read on a dark background.
 - **Customize the start screen** (activation) re-applies the saved choice
   whenever the plugin is enabled or Serein starts: on by default, spiky body
   first.
-- While it starts, Serein shows a compact splash window without its logo:
-  *Loading...* in the dither pixel font above the spinning model, with no
+- While it starts, Serein shows a 360x480 splash window without its logo: the
+  spinning model above *Loading...* in the dither pixel font, with no title or
   subtitle. The window's previous size and position return afterwards.
 - **Dither Loading settings** explains the current state and offers
   **Turn on/off** and **Next model**; the panel-list actions do the same.
