@@ -37,9 +37,10 @@ Each model is 64x64 cells of 3 pixels, spinning at 60°/s (5° a frame at 12
 fps). Every loop covers the smallest turn that maps its model onto itself, so it
 repeats seamlessly; the build fails if a loop's turn would not. *Loading...* is
 one still image, 16 pixels below the model, with 4-pixel glyph cells each filled
-by 2x2 dither cells. Lit model cells take the model color (soft violet and blue
-tones chosen to read on a dark background), the shaded rest of each silhouette
-and glyph the same color at 0.18 opacity, and lit text cells #EDEDEF.
+by 2x2 dither cells. Lit model cells use Serein's accent color (`accent` in the
+palette), the same blue as its loading bar, and follow your theme if you change
+it; the shaded rest of each silhouette is the accent at 0.18 opacity, and lit
+text cells are #EDEDEF.
 
 The spiky body's activation output is about 50 KB of JSON (37 KB of packed
 frames) and uses under 40% of the call's fuel; the other models need less.
@@ -69,7 +70,7 @@ frames) and uses under 40% of the call's fuel; the other models need less.
 ## Build and install
 
 The SDK dependency points at a local Serein checkout in `Cargo.toml`
-(`path = "../Serein/extensions/sdk"`); the release pins a git revision.
+(`path = "the pinned Serein revision"`); the release pins a git revision.
 
 ```sh
 rustup target add wasm32-unknown-unknown

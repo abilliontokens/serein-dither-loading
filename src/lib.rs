@@ -36,9 +36,10 @@ include!(concat!(env!("OUT_DIR"), "/art.rs"));
 
 /// How many models the plugin offers; `next-model` cycles through them.
 const MODEL_COUNT: usize = MODELS.len();
-/// Lit color of each model, chosen to read on a dark background. Its shade is the same
-/// color at 0x2E (about 0.18) opacity.
-const COLORS: [&str; MODEL_COUNT] = ["#B79CFF", "#8FB7FF", "#D3B8FF"];
+/// Lit model cells use Serein's current accent, the color of its progress bar, so the model
+/// matches the bar and follows the user's theme; the shade is the accent at 0x2E (about 0.18)
+/// opacity.
+const MODEL_PALETTE: [&str; 2] = ["accent", "accent:2E"];
 /// Color of the lit text pixels.
 const TEXT_COLOR: &str = "#EDEDEF";
 /// The splash window: 244 pixels of images (the model, then the text 16 pixels below it)
@@ -90,10 +91,9 @@ fn image(art: &Art, palette: &[String]) -> StartImage {
 /// The start screen with a given model: its spin loop above the still text. Both images
 /// share one palette for the cell values the renderer prints: 1 lit, 2 shade, 3 text.
 fn screen(model: usize) -> StartScreen {
-	let color = COLORS[model];
 	let palette = [
-		color.to_owned(),
-		format!("{color}2E"),
+		MODEL_PALETTE[0].to_owned(),
+		MODEL_PALETTE[1].to_owned(),
 		TEXT_COLOR.to_owned(),
 	];
 	StartScreen {
@@ -236,9 +236,18 @@ mod tests {
 		serde_json::from_slice(&wire(action, storage)).expect("wire JSON")
 	}
 
-	/// The lit color of the model a returned screen shows.
-	fn color(value: &Value) -> &Value {
-		&value["start_screen"]["images"][0]["palette"][0]
+	/// Which model a returned screen shows, by its loop length (every model's differs).
+	fn model(value: &Value) -> usize {
+		let frames = value["start_screen"]["images"][0]["frames"]
+			.as_array()
+			.map_or(0, Vec::len);
+		(0..MODEL_COUNT)
+			.find(|&index| {
+				let art = &MODELS[index].art;
+				art.cells.len() / (usize::from(art.width) * usize::from(art.height)).div_ceil(4)
+					== frames
+			})
+			.expect("a known model")
 	}
 
 	/// Standard padded base64, decoded without the plugin's digit table.
@@ -333,7 +342,7 @@ mod tests {
 			serde_json::json!({"width": 360, "height": 480})
 		);
 		let [model, text] = [&screen["images"][0], &screen["images"][1]];
-		let palette = serde_json::json!(["#B79CFF", "#B79CFF2E", "#EDEDEF"]);
+		let palette = serde_json::json!(["accent", "accent:2E", "#EDEDEF"]);
 		assert_eq!(model["palette"], palette);
 		assert_eq!(text["palette"], palette);
 		assert_eq!((&model["fps"], &model["cell"]), (&12.into(), &3.into()));
@@ -351,21 +360,21 @@ mod tests {
 		assert!(still_off.get("start_screen").is_some_and(Value::is_null));
 
 		let on = call("toggle", Some(&storage));
-		assert_eq!(color(&on), COLORS[0]);
+		assert_eq!(model(&on), 0);
 	}
 
 	#[test]
 	fn next_model_persists_and_cycles() {
 		let knot = call("next-model", None);
-		assert_eq!(color(&knot), COLORS[1]);
+		assert_eq!(model(&knot), 1);
 		let storage = knot["storage"].as_str().expect("persisted").to_string();
 
 		let crystal = call("next-model", Some(&storage));
-		assert_eq!(color(&crystal), COLORS[2]);
+		assert_eq!(model(&crystal), 2);
 		let storage = crystal["storage"].as_str().expect("persisted").to_string();
 
 		let spiky = call("next-model", Some(&storage));
-		assert_eq!(color(&spiky), COLORS[0]);
+		assert_eq!(model(&spiky), 0);
 	}
 
 	#[test]
@@ -378,7 +387,7 @@ mod tests {
 			"[]",
 		] {
 			let value = call("activate", Some(corrupt));
-			assert_eq!(color(&value), COLORS[0], "storage: {corrupt}");
+			assert_eq!(model(&value), 0, "storage: {corrupt}");
 		}
 	}
 }
